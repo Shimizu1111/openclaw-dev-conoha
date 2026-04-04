@@ -455,6 +455,37 @@ async def _poll_and_reply(channel, message, job_id: str) -> None:
         await message.reply(f"Error polling result: {exc}")
 
 
+def _try_local_answer(content: str) -> str | None:
+    """Check if the question can be answered from Redis data (projects, repos)."""
+    lower = content.lower()
+
+    # Project path queries
+    path_keywords = ["path", "パス", "どこ", "ディレクトリ", "フォルダ", "場所"]
+    if any(kw in lower for kw in path_keywords):
+        projects = redis_client.hgetall(PROJECTS_KEY)
+        matched = []
+        for name, url in projects.items():
+            if name.lower() in lower:
+                matched.append((name, url))
+        if matched:
+            lines = []
+            for name, url in matched:
+                lines.append(f"**{name}**: {url}")
+            return "\n".join(lines)
+
+    # List all projects
+    list_keywords = ["一覧", "リスト", "list", "全部", "すべて", "プロジェクト"]
+    if sum(1 for kw in list_keywords if kw in lower) >= 2:
+        projects = redis_client.hgetall(PROJECTS_KEY)
+        if projects:
+            lines = [f"**Projects ({len(projects)}):**"]
+            for name, url in sorted(projects.items()):
+                lines.append(f"- **{name}**: {url}")
+            return "\n".join(lines)
+
+    return None
+
+
 @bot.event
 async def on_message(message: discord.Message) -> None:
     # Ignore own messages
@@ -468,6 +499,12 @@ async def on_message(message: discord.Message) -> None:
     # Ignore empty messages
     content = message.content.strip()
     if not content:
+        return
+
+    # Try to answer from local data (projects, repos) before calling codex
+    answer = _try_local_answer(content)
+    if answer:
+        await message.reply(answer)
         return
 
     # Check if a repo is specified: "repo:URL message" or use default

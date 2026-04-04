@@ -483,6 +483,10 @@ def execute_job(payload: dict) -> None:
         store_status(job_id, {"status": "running"})
 
         # --- New job types that don't follow the normal clone→codex flow ---
+        if job_type == "chat":
+            _execute_chat_job(job_id, payload, job_dir, repo_dir)
+            return
+
         if job_type == "create_project":
             _execute_create_project_job(job_id, payload, job_dir, repo_dir)
             return
@@ -624,6 +628,61 @@ def _execute_pr_comment_job(
         },
     )
     print(f"Job {job_id}: Pushed fix to PR #{pr_number} at {pr_url}")
+
+
+# ---------------------------------------------------------------------------
+# Chat job
+# ---------------------------------------------------------------------------
+
+def _execute_chat_job(
+    job_id: str, payload: dict, job_dir: Path, repo_dir: Path,
+) -> None:
+    """Run codex and return the output directly (no PR, no push)."""
+    repo = payload.get("repo", "")
+
+    # Clone repo if specified (gives codex context)
+    if repo:
+        try:
+            clone_repo(repo, repo_dir)
+        except RuntimeError as e:
+            store_status(job_id, {"status": "failed", "error": f"Clone failed: {e}"})
+            return
+        work_dir = repo_dir
+    else:
+        work_dir = job_dir
+
+    # Write a simple task file
+    task_file = job_dir / "task.txt"
+    task_file.write_text(payload["task"], encoding="utf-8")
+
+    store_status(job_id, {"status": "executing"})
+    result = run_command(
+        [OPENCLAW_RUNNER, str(work_dir), str(task_file), job_id],
+        cwd=job_dir,
+    )
+
+    output = result.stdout.strip()
+    if result.returncode != 0:
+        error_output = result.stderr.strip() or output or "Runner failed"
+        store_status(
+            job_id,
+            {
+                "status": "failed",
+                "error": error_output,
+                "chat_response": error_output,
+            },
+        )
+        return
+
+    store_status(
+        job_id,
+        {
+            "status": "completed",
+            "result_summary": output[-200:] if len(output) > 200 else output,
+            "chat_response": output,
+        },
+    )
+    print(f"Job {job_id}: Chat response sent ({len(output)} chars)")
 
 
 # ---------------------------------------------------------------------------

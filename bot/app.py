@@ -36,9 +36,19 @@ for _repo in _INITIAL_ALLOWED_REPOS:
     redis_client.sadd(ALLOWED_REPOS_KEY, _repo)
 
 
+CHAT_CHANNEL_IDS = {
+    int(ch.strip())
+    for ch in os.getenv("CHAT_CHANNEL_IDS", "").split(",")
+    if ch.strip()
+}
+CHAT_DEFAULT_REPO = os.getenv("CHAT_DEFAULT_REPO", "")
+CHAT_POLL_INTERVAL = int(os.getenv("CHAT_POLL_INTERVAL", "3"))
+
+
 class OpenClawBot(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
+        intents.message_content = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
@@ -330,6 +340,125 @@ async def list_repos(interaction: discord.Interaction) -> None:
 @bot.event
 async def on_ready() -> None:
     print(f"Discord bot connected as {bot.user}")
+    if CHAT_CHANNEL_IDS:
+        print(f"Chat channels: {CHAT_CHANNEL_IDS}")
+
+
+# ---------------------------------------------------------------------------
+# Chat mode: messages in designated channels are forwarded to codex
+# ---------------------------------------------------------------------------
+
+import asyncio
+
+
+def _split_message(text: str, limit: int = 1990) -> list[str]:
+    """Split text into chunks that fit within Discord's 2000-char limit."""
+    if len(text) <= limit:
+        return [text]
+    chunks = []
+    while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
+        # Try to split at a newline
+        idx = text.rfind("\n", 0, limit)
+        if idx == -1:
+            idx = limit
+        chunks.append(text[:idx])
+        text = text[idx:].lstrip("\n")
+    return chunks
+
+
+async def _poll_and_reply(channel, message, job_id: str) -> None:
+    """Poll Redis for job completion, then reply with the result."""
+    key = job_key(job_id)
+    try:
+        while True:
+            await asyncio.sleep(CHAT_POLL_INTERVAL)
+            status = redis_client.hgetall(key)
+            if not status:
+                break
+            job_status = status.get("status", "")
+            if job_status in ("completed", "failed"):
+                break
+
+        status = redis_client.hgetall(key)
+        if not status:
+            await message.reply("Job not found.")
+            return
+
+        if status.get("status") == "failed":
+            error = status.get("error", "Unknown error")
+            await message.reply(f"Error: {error}")
+            return
+
+        # Send the chat response
+        response = status.get("chat_response", "")
+        if not response:
+            response = status.get("result_summary", "No response.")
+
+        chunks = _split_message(response)
+        for chunk in chunks:
+            await message.reply(chunk)
+
+    except Exception as exc:
+        await message.reply(f"Error polling result: {exc}")
+
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    # Ignore own messages
+    if message.author == bot.user:
+        return
+
+    # Only respond in designated chat channels
+    if not CHAT_CHANNEL_IDS or message.channel.id not in CHAT_CHANNEL_IDS:
+        return
+
+    # Ignore empty messages
+    content = message.content.strip()
+    if not content:
+        return
+
+    # Check if a repo is specified: "repo:URL message" or use default
+    repo = CHAT_DEFAULT_REPO
+    if content.lower().startswith("repo:"):
+        parts = content.split(None, 1)
+        repo = parts[0][5:]  # strip "repo:" prefix
+        content = parts[1] if len(parts) > 1 else ""
+        if not content:
+            await message.reply("Please provide a message after the repo URL.")
+            return
+
+    # Show typing indicator
+    async with message.channel.typing():
+        job_id = str(uuid.uuid4())
+        payload = {
+            "job_id": job_id,
+            "type": "chat",
+            "task": content,
+            "requested_by": str(message.author),
+            "requested_by_id": str(message.author.id),
+            "created_at": utc_now(),
+        }
+        if repo:
+            payload["repo"] = repo
+
+        store_status(
+            job_id,
+            {
+                "status": "queued",
+                "repo": repo or "(no repo)",
+                "task": content,
+                "requested_by": str(message.author),
+                "created_at": payload["created_at"],
+                "updated_at": payload["created_at"],
+            },
+        )
+        enqueue_job(payload)
+
+    # Poll in background and reply when done
+    bot.loop.create_task(_poll_and_reply(message.channel, message, job_id))
 
 
 bot.run(DISCORD_BOT_TOKEN)

@@ -1,3 +1,4 @@
+smoke test OK
 hello world2
 
 ConoHa VPS 上に OpenClaw 実行基盤を置き、Discord から開発依頼を送れるようにするための MVP 構成です。

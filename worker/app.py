@@ -49,36 +49,45 @@ def run_command(args: List[str], cwd: Optional[Path] = None) -> subprocess.Compl
 
 def parse_github_owner_repo(repo_url: str) -> Tuple[str, str]:
     """Extract owner and repo name from GitHub URL (HTTPS or SSH)."""
-    # SSH: git@github.com:owner/repo.git
     m = re.match(r"git@github\.com:([^/]+)/([^/.]+?)(?:\.git)?$", repo_url)
     if m:
         return m.group(1), m.group(2)
-    # HTTPS: https://github.com/owner/repo.git
     m = re.match(r"https?://github\.com/([^/]+)/([^/.]+?)(?:\.git)?$", repo_url)
     if m:
         return m.group(1), m.group(2)
     raise ValueError(f"Cannot parse GitHub owner/repo from: {repo_url}")
 
 
-def clone_repo(repo: str, destination: Path) -> None:
-    """Clone repo default branch. Use HTTPS + token auth when GITHUB_TOKEN is set."""
-    clone_target = repo
+def build_clone_url(repo: str) -> str:
+    """Build an authenticated HTTPS clone URL."""
     if GITHUB_TOKEN:
         owner, name = parse_github_owner_repo(repo)
-        clone_target = f"https://x-access-token:{GITHUB_TOKEN}@github.com/{owner}/{name}.git"
+        return f"https://x-access-token:{GITHUB_TOKEN}@github.com/{owner}/{name}.git"
+    return repo
 
-    result = run_command(
-        ["git", "clone", clone_target, str(destination)]
-    )
+
+def clone_repo(repo: str, destination: Path) -> None:
+    """Clone repo default branch."""
+    result = run_command(["git", "clone", build_clone_url(repo), str(destination)])
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "git clone failed")
+
+
+def clone_and_checkout_branch(repo: str, destination: Path, branch: str) -> None:
+    """Clone repo and checkout a specific branch (e.g. a PR head branch)."""
+    clone_repo(repo, destination)
+    result = run_command(["git", "fetch", "origin", branch], cwd=destination)
+    if result.returncode != 0:
+        raise RuntimeError(f"git fetch failed: {result.stderr.strip()}")
+    result = run_command(["git", "checkout", branch], cwd=destination)
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to checkout branch {branch}: {result.stderr.strip()}")
 
 
 def detect_default_branch(repo_dir: Path) -> str:
     """Detect the default branch name from the cloned repo."""
     result = run_command(["git", "symbolic-ref", "refs/remotes/origin/HEAD"], cwd=repo_dir)
     if result.returncode == 0:
-        # e.g. "refs/remotes/origin/main" -> "main"
         return result.stdout.strip().split("/")[-1]
     return "main"
 
@@ -88,9 +97,8 @@ def collect_git_summary(repo_dir: Path) -> str:
     return result.stdout.strip() or "No tracked changes."
 
 
-def collect_git_diff_detail(repo_dir: Path) -> str:
+def collect_git_diff_detail(repo_dir: Path) -> Tuple[str, str]:
     """Collect detailed diff of all changes (staged + unstaged + untracked)."""
-    # Stage everything so we can get a unified diff
     run_command(["git", "add", "-A"], cwd=repo_dir)
     result = run_command(["git", "diff", "--cached", "--stat"], cwd=repo_dir)
     stat = result.stdout.strip()
@@ -121,16 +129,23 @@ def collect_file_change_summary(repo_dir: Path) -> str:
     return "\n".join(lines) if lines else "No file changes detected."
 
 
-def git_commit_and_push(repo_dir: Path, branch_name: str, commit_message: str) -> None:
-    """Configure git, commit all changes, and push to the new branch."""
+# ---------------------------------------------------------------------------
+# Git push helpers
+# ---------------------------------------------------------------------------
+
+def _configure_git(repo_dir: Path) -> None:
     run_command(["git", "config", "user.name", GIT_AUTHOR_NAME], cwd=repo_dir)
     run_command(["git", "config", "user.email", GIT_AUTHOR_EMAIL], cwd=repo_dir)
+
+
+def git_commit_and_push(repo_dir: Path, branch_name: str, commit_message: str) -> None:
+    """Create a new branch, commit all staged changes, and push."""
+    _configure_git(repo_dir)
 
     result = run_command(["git", "checkout", "-b", branch_name], cwd=repo_dir)
     if result.returncode != 0:
         raise RuntimeError(f"Failed to create branch {branch_name}: {result.stderr.strip()}")
 
-    # Files are already staged by collect_git_diff_detail
     result = run_command(["git", "commit", "-m", commit_message], cwd=repo_dir)
     if result.returncode != 0:
         raise RuntimeError(f"git commit failed: {result.stderr.strip()}")
@@ -140,40 +155,64 @@ def git_commit_and_push(repo_dir: Path, branch_name: str, commit_message: str) -
         raise RuntimeError(f"git push failed: {result.stderr.strip()}")
 
 
-def create_pull_request(
-    owner: str,
-    repo_name: str,
-    head_branch: str,
-    base_branch: str,
-    title: str,
-    body: str,
-) -> str:
-    """Create a GitHub Pull Request via the API. Returns the PR URL."""
-    url = f"https://api.github.com/repos/{owner}/{repo_name}/pulls"
-    headers = {
+def git_commit_and_push_existing(repo_dir: Path, branch_name: str, commit_message: str) -> None:
+    """Commit all staged changes and push to an existing remote branch."""
+    _configure_git(repo_dir)
+
+    result = run_command(["git", "commit", "-m", commit_message], cwd=repo_dir)
+    if result.returncode != 0:
+        raise RuntimeError(f"git commit failed: {result.stderr.strip()}")
+
+    result = run_command(["git", "push", "origin", branch_name], cwd=repo_dir)
+    if result.returncode != 0:
+        raise RuntimeError(f"git push failed: {result.stderr.strip()}")
+
+
+# ---------------------------------------------------------------------------
+# GitHub API helpers
+# ---------------------------------------------------------------------------
+
+def _github_headers() -> dict:
+    return {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    data = {
-        "title": title,
-        "body": body,
-        "head": head_branch,
-        "base": base_branch,
-    }
-    resp = requests.post(url, headers=headers, json=data, timeout=30)
+
+
+def create_pull_request(
+    owner: str, repo_name: str, head_branch: str, base_branch: str,
+    title: str, body: str,
+) -> str:
+    """Create a GitHub Pull Request. Returns the PR URL."""
+    url = f"https://api.github.com/repos/{owner}/{repo_name}/pulls"
+    data = {"title": title, "body": body, "head": head_branch, "base": base_branch}
+    resp = requests.post(url, headers=_github_headers(), json=data, timeout=30)
     if resp.status_code not in (200, 201):
-        raise RuntimeError(
-            f"GitHub PR creation failed ({resp.status_code}): {resp.text}"
-        )
+        raise RuntimeError(f"GitHub PR creation failed ({resp.status_code}): {resp.text}")
     return resp.json()["html_url"]
 
 
+def post_pr_comment(owner: str, repo_name: str, pr_number: int, body: str) -> None:
+    """Post a comment on a GitHub PR."""
+    url = f"https://api.github.com/repos/{owner}/{repo_name}/issues/{pr_number}/comments"
+    resp = requests.post(url, headers=_github_headers(), json={"body": body}, timeout=30)
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"Failed to post PR comment ({resp.status_code}): {resp.text}")
+
+
+# ---------------------------------------------------------------------------
+# Message builders
+# ---------------------------------------------------------------------------
+
+def _truncate_diff(diff: str, max_len: int = 50000) -> str:
+    if len(diff) > max_len:
+        return diff[:max_len] + "\n\n... (diff truncated due to size)"
+    return diff
+
+
 def build_pr_body(
-    payload: dict,
-    file_change_summary: str,
-    diff_stat: str,
-    diff: str,
+    payload: dict, file_change_summary: str, diff_stat: str, diff: str,
 ) -> str:
     """Build a detailed PR description."""
     task = payload["task"]
@@ -181,12 +220,7 @@ def build_pr_body(
     job_id = payload["job_id"]
     branch = payload["branch"]
     created_at = payload.get("created_at", "N/A")
-
-    # Truncate diff if too large for PR body (GitHub limit ~65536 chars)
-    max_diff_len = 50000
-    diff_display = diff
-    if len(diff) > max_diff_len:
-        diff_display = diff[:max_diff_len] + "\n\n... (diff truncated due to size)"
+    diff_display = _truncate_diff(diff)
 
     return f"""## Overview
 
@@ -233,8 +267,45 @@ This PR was automatically generated by **OpenClaw** based on a task requested vi
 """
 
 
+def build_pr_comment_body(
+    payload: dict, file_change_summary: str, diff_stat: str, diff: str,
+) -> str:
+    """Build a PR comment describing the auto-fix that was applied."""
+    task = payload["task"]
+    job_id = payload["job_id"]
+    requested_by = payload["requested_by"]
+    diff_display = _truncate_diff(diff)
+
+    return f"""## OpenClaw Auto-Fix Applied
+
+**Task:** {task}
+**Job ID:** `{job_id}`
+
+### Files Changed
+
+{file_change_summary}
+
+### Diff Stats
+
+```
+{diff_stat}
+```
+
+<details>
+<summary>Full Diff</summary>
+
+```diff
+{diff_display}
+```
+
+</details>
+
+---
+*Triggered by {requested_by} via PR comment*
+"""
+
+
 def build_commit_message(payload: dict, file_change_summary: str, diff_stat: str) -> str:
-    """Build a detailed commit message."""
     task = payload["task"]
     job_id = payload["job_id"]
     requested_by = payload["requested_by"]
@@ -253,6 +324,10 @@ Stats:
 {diff_stat}
 """
 
+
+# ---------------------------------------------------------------------------
+# Task file
+# ---------------------------------------------------------------------------
 
 def write_task_file(job_dir: Path, payload: dict) -> Path:
     task_file = job_dir / "task.txt"
@@ -278,15 +353,26 @@ def write_task_file(job_dir: Path, payload: dict) -> Path:
     return task_file
 
 
+# ---------------------------------------------------------------------------
+# Job execution
+# ---------------------------------------------------------------------------
+
 def execute_job(payload: dict) -> None:
     job_id = payload["job_id"]
+    job_type = payload.get("type", "discord")
     WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
     job_dir = Path(tempfile.mkdtemp(prefix=f"{job_id}-", dir=WORKSPACE_ROOT))
     repo_dir = job_dir / "repo"
 
     try:
         store_status(job_id, {"status": "running"})
-        clone_repo(payload["repo"], repo_dir)
+
+        # Clone: for PR comment jobs, checkout the PR branch
+        if job_type == "pr_comment":
+            clone_and_checkout_branch(payload["repo"], repo_dir, payload["branch"])
+        else:
+            clone_repo(payload["repo"], repo_dir)
+
         task_file = write_task_file(job_dir, payload)
 
         store_status(job_id, {"status": "executing"})
@@ -309,7 +395,7 @@ def execute_job(payload: dict) -> None:
         diff_stat, diff = collect_git_diff_detail(repo_dir)
         file_change_summary = collect_file_change_summary(repo_dir)
 
-        # If there are no changes, mark as completed without PR
+        # If there are no changes, mark as completed without push
         if not diff_stat:
             stdout = result.stdout.strip().splitlines()
             summary = stdout[-1] if stdout else "Runner completed."
@@ -322,32 +408,20 @@ def execute_job(payload: dict) -> None:
             )
             return
 
-        # Push changes and create PR
-        store_status(job_id, {"status": "pushing"})
-        branch_name = f"openclaw/{job_id[:8]}"
-        base_branch = detect_default_branch(repo_dir)
-        owner, repo_name = parse_github_owner_repo(payload["repo"])
-
         commit_message = build_commit_message(payload, file_change_summary, diff_stat)
-        git_commit_and_push(repo_dir, branch_name, commit_message)
 
-        store_status(job_id, {"status": "creating_pr"})
-        pr_title = f"openclaw: {payload['task'][:60]}"
-        pr_body = build_pr_body(payload, file_change_summary, diff_stat, diff)
-        pr_url = create_pull_request(owner, repo_name, branch_name, base_branch, pr_title, pr_body)
-
-        stdout = result.stdout.strip().splitlines()
-        summary = stdout[-1] if stdout else "Runner completed."
-        store_status(
-            job_id,
-            {
-                "status": "completed",
-                "result_summary": f"{summary}\n{git_summary}",
-                "pr_url": pr_url,
-                "branch": branch_name,
-            },
-        )
-        print(f"Job {job_id}: PR created at {pr_url}")
+        if job_type == "pr_comment":
+            _execute_pr_comment_job(
+                job_id, payload, repo_dir, result,
+                commit_message, git_summary,
+                file_change_summary, diff_stat, diff,
+            )
+        else:
+            _execute_discord_job(
+                job_id, payload, repo_dir, result,
+                commit_message, git_summary,
+                file_change_summary, diff_stat, diff,
+            )
 
     except Exception as exc:
         store_status(job_id, {"status": "failed", "error": str(exc)})
@@ -356,6 +430,75 @@ def execute_job(payload: dict) -> None:
         if not keep_workspace and job_dir.exists():
             shutil.rmtree(job_dir, ignore_errors=True)
 
+
+def _execute_discord_job(
+    job_id, payload, repo_dir, result,
+    commit_message, git_summary,
+    file_change_summary, diff_stat, diff,
+):
+    """Push to a new branch and create a PR (Discord flow)."""
+    store_status(job_id, {"status": "pushing"})
+    branch_name = f"openclaw/{job_id[:8]}"
+    base_branch = detect_default_branch(repo_dir)
+    owner, repo_name = parse_github_owner_repo(payload["repo"])
+
+    git_commit_and_push(repo_dir, branch_name, commit_message)
+
+    store_status(job_id, {"status": "creating_pr"})
+    pr_title = f"openclaw: {payload['task'][:60]}"
+    pr_body = build_pr_body(payload, file_change_summary, diff_stat, diff)
+    pr_url = create_pull_request(owner, repo_name, branch_name, base_branch, pr_title, pr_body)
+
+    stdout = result.stdout.strip().splitlines()
+    summary = stdout[-1] if stdout else "Runner completed."
+    store_status(
+        job_id,
+        {
+            "status": "completed",
+            "result_summary": f"{summary}\n{git_summary}",
+            "pr_url": pr_url,
+            "branch": branch_name,
+        },
+    )
+    print(f"Job {job_id}: PR created at {pr_url}")
+
+
+def _execute_pr_comment_job(
+    job_id, payload, repo_dir, result,
+    commit_message, git_summary,
+    file_change_summary, diff_stat, diff,
+):
+    """Push to the existing PR branch and post a comment (PR comment flow)."""
+    store_status(job_id, {"status": "pushing"})
+    branch_name = payload["branch"]
+    pr_number = payload["pr_number"]
+    owner = payload["pr_owner"]
+    repo_name = payload["pr_repo_name"]
+
+    git_commit_and_push_existing(repo_dir, branch_name, commit_message)
+
+    store_status(job_id, {"status": "commenting"})
+    comment_body = build_pr_comment_body(payload, file_change_summary, diff_stat, diff)
+    post_pr_comment(owner, repo_name, pr_number, comment_body)
+
+    pr_url = f"https://github.com/{owner}/{repo_name}/pull/{pr_number}"
+    stdout = result.stdout.strip().splitlines()
+    summary = stdout[-1] if stdout else "Runner completed."
+    store_status(
+        job_id,
+        {
+            "status": "completed",
+            "result_summary": f"Pushed fix to PR #{pr_number}\n{git_summary}",
+            "pr_url": pr_url,
+            "branch": branch_name,
+        },
+    )
+    print(f"Job {job_id}: Pushed fix to PR #{pr_number} at {pr_url}")
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     print("Worker started.")

@@ -27,6 +27,17 @@ services:
       - workspace_data:/workspace/jobs
       - ${CODEX_HOST_CONFIG_DIR:-/root/.codex}:/root/.codex
 
+  webhook:
+    build:
+      context: ./webhook
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      - redis
+
 volumes:
   redis_data:
   workspace_data:

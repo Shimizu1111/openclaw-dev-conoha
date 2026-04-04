@@ -337,6 +337,56 @@ async def list_repos(interaction: discord.Interaction) -> None:
         await interaction.followup.send("No repositories configured.", ephemeral=True)
 
 
+PROJECTS_KEY = "openclaw:projects"
+
+
+@bot.tree.command(
+    name="list-projects",
+    description="List all registered projects and their directories.",
+    guild=discord.Object(id=DISCORD_GUILD_ID),
+)
+async def list_projects(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+    projects = redis_client.hgetall(PROJECTS_KEY)
+    if projects:
+        lines = [f"**Projects ({len(projects)}):**"]
+        for name, path in sorted(projects.items()):
+            lines.append(f"- **{name}**: `{path}`")
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+    else:
+        await interaction.followup.send("No projects registered. Use `/register-project` to add one.", ephemeral=True)
+
+
+@bot.tree.command(
+    name="register-project",
+    description="Register a project name and its directory path.",
+    guild=discord.Object(id=DISCORD_GUILD_ID),
+)
+@app_commands.describe(
+    name="Project name (e.g., openclaw-dev-conoha)",
+    path="Directory path on the server (e.g., /root/apps/openclaw-dev-conoha)",
+)
+async def register_project(interaction: discord.Interaction, name: str, path: str) -> None:
+    await interaction.response.defer(ephemeral=True)
+    redis_client.hset(PROJECTS_KEY, name, path)
+    await interaction.followup.send(f"Registered project **{name}** at `{path}`", ephemeral=True)
+
+
+@bot.tree.command(
+    name="unregister-project",
+    description="Remove a project from the list.",
+    guild=discord.Object(id=DISCORD_GUILD_ID),
+)
+@app_commands.describe(name="Project name to remove")
+async def unregister_project(interaction: discord.Interaction, name: str) -> None:
+    await interaction.response.defer(ephemeral=True)
+    removed = redis_client.hdel(PROJECTS_KEY, name)
+    if removed:
+        await interaction.followup.send(f"Removed project **{name}**.", ephemeral=True)
+    else:
+        await interaction.followup.send(f"Project **{name}** not found.", ephemeral=True)
+
+
 @bot.event
 async def on_ready() -> None:
     print(f"Discord bot connected as {bot.user}")

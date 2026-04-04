@@ -18,13 +18,19 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "")
 TRIGGER_KEYWORD = os.getenv("OPENCLAW_TRIGGER", "@openclaw")
 
-ALLOWED_REPOS = {
+ALLOWED_REPOS_KEY = "openclaw:allowed_repos"
+
+_INITIAL_ALLOWED_REPOS = {
     repo.strip()
     for repo in os.getenv("ALLOWED_REPOS", "").split(",")
     if repo.strip()
 }
 
 redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
+
+# Seed allowed repos into Redis set (additive, idempotent)
+for _repo in _INITIAL_ALLOWED_REPOS:
+    redis_client.sadd(ALLOWED_REPOS_KEY, _repo)
 
 
 def utc_now() -> str:
@@ -122,7 +128,7 @@ async def github_webhook(
     commenter = payload["comment"]["user"]["login"]
 
     # Validate repo is allowed
-    if clone_url not in ALLOWED_REPOS:
+    if not redis_client.sismember(ALLOWED_REPOS_KEY, clone_url):
         return {"status": "rejected", "reason": "repo not allowed"}
 
     # Fetch the PR's head branch

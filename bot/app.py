@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 
@@ -20,13 +21,19 @@ DISCORD_GUILD_ID = int(os.environ["DISCORD_GUILD_ID"])
 DEFAULT_BRANCH = os.getenv("DEFAULT_BRANCH", "main")
 SYNC_COMMANDS = os.getenv("SYNC_COMMANDS", "true").lower() == "true"
 
-ALLOWED_REPOS = {
+ALLOWED_REPOS_KEY = "openclaw:allowed_repos"
+
+_INITIAL_ALLOWED_REPOS = {
     repo.strip()
     for repo in os.getenv("ALLOWED_REPOS", "").split(",")
     if repo.strip()
 }
 
 redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
+
+# Seed allowed repos into Redis set (additive, idempotent)
+for _repo in _INITIAL_ALLOWED_REPOS:
+    redis_client.sadd(ALLOWED_REPOS_KEY, _repo)
 
 
 class OpenClawBot(discord.Client):
@@ -75,8 +82,8 @@ async def dev_task(
 ) -> None:
     await interaction.response.defer(ephemeral=True)
 
-    if repo not in ALLOWED_REPOS:
-        allowed = "\n".join(sorted(ALLOWED_REPOS)) or "No repositories configured."
+    if not redis_client.sismember(ALLOWED_REPOS_KEY, repo):
+        allowed = "\n".join(sorted(redis_client.smembers(ALLOWED_REPOS_KEY))) or "No repositories configured."
         await interaction.followup.send(
             f"`repo` is not allowed.\nAllowed repos:\n{allowed}",
             ephemeral=True,
@@ -144,6 +151,8 @@ async def job_status(interaction: discord.Interaction, job_id: str) -> None:
         f"Updated at: `{status.get('updated_at', '-')}`",
     ]
 
+    if status.get("repo_url"):
+        lines.append(f"Repo: {status['repo_url']}")
     if status.get("pr_url"):
         lines.append(f"PR: {status['pr_url']}")
     if status.get("result_summary"):
@@ -152,6 +161,170 @@ async def job_status(interaction: discord.Interaction, job_id: str) -> None:
         lines.append(f"Error: {status['error']}")
 
     await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+GITHUB_DEFAULT_ORG = os.getenv("GITHUB_DEFAULT_ORG", "")
+
+REPO_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+
+
+@bot.tree.command(
+    name="create-project",
+    description="Create a new GitHub repository and optionally run an initial task.",
+    guild=discord.Object(id=DISCORD_GUILD_ID),
+)
+@app_commands.describe(
+    name="Repository name (e.g., my-new-project)",
+    description="Short description for the repository",
+    task="Optional initial development task for OpenClaw to execute",
+    private="Whether the repo should be private (default: False)",
+    org="GitHub org or user (defaults to GITHUB_DEFAULT_ORG)",
+)
+async def create_project(
+    interaction: discord.Interaction,
+    name: str,
+    description: str = "",
+    task: str = "",
+    private: bool = False,
+    org: str = "",
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+
+    if not REPO_NAME_RE.match(name):
+        await interaction.followup.send(
+            "Invalid repo name. Use only letters, numbers, hyphens, dots, and underscores.",
+            ephemeral=True,
+        )
+        return
+
+    target_org = org or GITHUB_DEFAULT_ORG
+    if not target_org:
+        await interaction.followup.send(
+            "No GitHub org/user specified. Set `GITHUB_DEFAULT_ORG` env var or provide `org` parameter.",
+            ephemeral=True,
+        )
+        return
+
+    job_id = str(uuid.uuid4())
+    payload = {
+        "job_id": job_id,
+        "type": "create_project",
+        "name": name,
+        "description": description,
+        "task": task,
+        "private": private,
+        "org": target_org,
+        "requested_by": str(interaction.user),
+        "requested_by_id": str(interaction.user.id),
+        "created_at": utc_now(),
+    }
+
+    store_status(
+        job_id,
+        {
+            "status": "queued",
+            "repo": f"(new) {target_org}/{name}",
+            "task": task or "(create repo only)",
+            "requested_by": str(interaction.user),
+            "created_at": payload["created_at"],
+            "updated_at": payload["created_at"],
+        },
+    )
+    enqueue_job(payload)
+
+    lines = [
+        f"Queued project creation `{job_id}`",
+        f"Repo: `{target_org}/{name}`",
+        f"Private: `{private}`",
+    ]
+    if task:
+        lines.append(f"Initial task: {task}")
+    else:
+        lines.append("No initial task — repo will be created empty.")
+
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(
+    name="add-reference",
+    description="Add a cross-repo reference to a project's openclaw.yml.",
+    guild=discord.Object(id=DISCORD_GUILD_ID),
+)
+@app_commands.describe(
+    repo="Target repository URL (must be allowed)",
+    ref_repo="Referenced repository URL (must be allowed)",
+    ref_path="Path within referenced repo (e.g., src/components)",
+    mount_as="Where to mount in target repo (e.g., ./vendor/shared-components)",
+)
+async def add_reference(
+    interaction: discord.Interaction,
+    repo: str,
+    ref_repo: str,
+    ref_path: str,
+    mount_as: str,
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+
+    if not redis_client.sismember(ALLOWED_REPOS_KEY, repo):
+        await interaction.followup.send(f"Target repo `{repo}` is not in the allowed list.", ephemeral=True)
+        return
+
+    if not redis_client.sismember(ALLOWED_REPOS_KEY, ref_repo):
+        await interaction.followup.send(f"Referenced repo `{ref_repo}` is not in the allowed list.", ephemeral=True)
+        return
+
+    job_id = str(uuid.uuid4())
+    payload = {
+        "job_id": job_id,
+        "type": "add_reference",
+        "repo": repo,
+        "ref_repo": ref_repo,
+        "ref_path": ref_path,
+        "mount_as": mount_as,
+        "requested_by": str(interaction.user),
+        "requested_by_id": str(interaction.user.id),
+        "created_at": utc_now(),
+    }
+
+    store_status(
+        job_id,
+        {
+            "status": "queued",
+            "repo": repo,
+            "task": f"Add reference: {ref_repo} ({ref_path}) -> {mount_as}",
+            "requested_by": str(interaction.user),
+            "created_at": payload["created_at"],
+            "updated_at": payload["created_at"],
+        },
+    )
+    enqueue_job(payload)
+
+    await interaction.followup.send(
+        "\n".join([
+            f"Queued reference addition `{job_id}`",
+            f"Target: `{repo}`",
+            f"Reference: `{ref_repo}` path `{ref_path}`",
+            f"Mount as: `{mount_as}`",
+        ]),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="list-repos",
+    description="List all allowed repositories.",
+    guild=discord.Object(id=DISCORD_GUILD_ID),
+)
+async def list_repos(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+    repos = sorted(redis_client.smembers(ALLOWED_REPOS_KEY))
+    if repos:
+        lines = [f"**Allowed repositories ({len(repos)}):**"]
+        for r in repos:
+            lines.append(f"- `{r}`")
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+    else:
+        await interaction.followup.send("No repositories configured.", ephemeral=True)
 
 
 @bot.event

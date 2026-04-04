@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import requests
+import yaml
 from redis import Redis
 
 
@@ -24,6 +25,8 @@ OPENCLAW_RUNNER = os.getenv("OPENCLAW_RUNNER", "/app/run_openclaw.sh")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GIT_AUTHOR_NAME = os.getenv("GIT_AUTHOR_NAME", "OpenClaw Bot")
 GIT_AUTHOR_EMAIL = os.getenv("GIT_AUTHOR_EMAIL", "openclaw-bot@users.noreply.github.com")
+GITHUB_DEFAULT_ORG = os.getenv("GITHUB_DEFAULT_ORG", "")
+ALLOWED_REPOS_KEY = "openclaw:allowed_repos"
 
 redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
 
@@ -326,30 +329,142 @@ Stats:
 
 
 # ---------------------------------------------------------------------------
+# GitHub repo creation
+# ---------------------------------------------------------------------------
+
+def create_github_repo(name: str, description: str, private: bool, org: str = "") -> str:
+    """Create a GitHub repo. Returns the clone URL (https)."""
+    target_org = org or GITHUB_DEFAULT_ORG
+    if target_org:
+        url = f"https://api.github.com/orgs/{target_org}/repos"
+    else:
+        url = "https://api.github.com/user/repos"
+
+    data = {
+        "name": name,
+        "description": description,
+        "private": private,
+        "auto_init": True,
+    }
+    resp = requests.post(url, headers=_github_headers(), json=data, timeout=30)
+
+    # If org endpoint fails with 404, fall back to user endpoint
+    if resp.status_code == 404 and target_org:
+        url = "https://api.github.com/user/repos"
+        resp = requests.post(url, headers=_github_headers(), json=data, timeout=30)
+
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"Repo creation failed ({resp.status_code}): {resp.text}")
+
+    return resp.json()["clone_url"]
+
+
+# ---------------------------------------------------------------------------
+# Cross-repo references (openclaw.yml)
+# ---------------------------------------------------------------------------
+
+def process_references(repo_dir: Path, job_dir: Path) -> List[Path]:
+    """
+    Read openclaw.yml from repo root, clone referenced repos,
+    copy specified paths into the repo at mount_as locations.
+    Returns list of mounted paths (for cleanup after Codex run).
+    """
+    config_path = repo_dir / "openclaw.yml"
+    if not config_path.exists():
+        return []
+
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    if not config:
+        return []
+    references = config.get("references", [])
+    if not references:
+        return []
+
+    mounted_paths: List[Path] = []
+    for ref in references:
+        ref_repo = ref.get("repo", "")
+        ref_path = ref.get("path", ".")
+        mount_as = ref.get("mount_as", "")
+        if not ref_repo or not mount_as:
+            continue
+
+        # Security: only allow repos in the allowed set
+        if not redis_client.sismember(ALLOWED_REPOS_KEY, ref_repo):
+            print(f"Warning: referenced repo {ref_repo} not in allowed list, skipping")
+            continue
+
+        ref_clone_dir = Path(tempfile.mkdtemp(prefix="ref-", dir=job_dir))
+        try:
+            clone_repo(ref_repo, ref_clone_dir / "repo")
+        except RuntimeError as e:
+            print(f"Warning: failed to clone reference {ref_repo}: {e}")
+            continue
+
+        source = ref_clone_dir / "repo" / ref_path
+        destination = repo_dir / mount_as
+        destination.parent.mkdir(parents=True, exist_ok=True)
+
+        if source.is_dir():
+            shutil.copytree(str(source), str(destination), dirs_exist_ok=True)
+        elif source.is_file():
+            shutil.copy2(str(source), str(destination))
+        else:
+            print(f"Warning: reference path {ref_path} not found in {ref_repo}")
+            continue
+
+        mounted_paths.append(destination)
+
+    return mounted_paths
+
+
+def cleanup_references(mounted_paths: List[Path]) -> None:
+    """Remove mounted reference directories before collecting diffs."""
+    for path in mounted_paths:
+        if path.exists():
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # Task file
 # ---------------------------------------------------------------------------
 
-def write_task_file(job_dir: Path, payload: dict) -> Path:
+def write_task_file(
+    job_dir: Path,
+    payload: dict,
+    repo_dir: Optional[Path] = None,
+    mounted_paths: Optional[List[Path]] = None,
+) -> Path:
+    lines = [
+        f"Job ID: {payload['job_id']}",
+        f"Repository: {payload['repo']}",
+        f"Branch: {payload.get('branch', 'main')}",
+        f"Requested By: {payload['requested_by']}",
+        "",
+        "Task:",
+        payload["task"],
+        "",
+        "Instructions:",
+        "- Work only inside this repository.",
+        "- Make the requested code changes.",
+        "- Leave a clean diff for review.",
+    ]
+
+    if mounted_paths and repo_dir:
+        lines.append("")
+        lines.append("Reference files (read-only context from other repos):")
+        for p in mounted_paths:
+            try:
+                rel = p.relative_to(repo_dir)
+            except ValueError:
+                rel = p
+            lines.append(f"- {rel}")
+        lines.append("Do NOT modify files in these reference directories.")
+
     task_file = job_dir / "task.txt"
-    task_file.write_text(
-        "\n".join(
-            [
-                f"Job ID: {payload['job_id']}",
-                f"Repository: {payload['repo']}",
-                f"Branch: {payload['branch']}",
-                f"Requested By: {payload['requested_by']}",
-                "",
-                "Task:",
-                payload["task"],
-                "",
-                "Instructions:",
-                "- Work only inside this repository.",
-                "- Make the requested code changes.",
-                "- Leave a clean diff for review.",
-            ]
-        ),
-        encoding="utf-8",
-    )
+    task_file.write_text("\n".join(lines), encoding="utf-8")
     return task_file
 
 
@@ -367,16 +482,31 @@ def execute_job(payload: dict) -> None:
     try:
         store_status(job_id, {"status": "running"})
 
+        # --- New job types that don't follow the normal clone→codex flow ---
+        if job_type == "create_project":
+            _execute_create_project_job(job_id, payload, job_dir, repo_dir)
+            return
+
+        if job_type == "add_reference":
+            _execute_add_reference_job(job_id, payload, job_dir, repo_dir)
+            return
+
         # Clone: for PR comment jobs, checkout the PR branch
         if job_type == "pr_comment":
             clone_and_checkout_branch(payload["repo"], repo_dir, payload["branch"])
         else:
             clone_repo(payload["repo"], repo_dir)
 
-        task_file = write_task_file(job_dir, payload)
+        # Process cross-repo references from openclaw.yml
+        mounted_paths = process_references(repo_dir, job_dir)
+
+        task_file = write_task_file(job_dir, payload, repo_dir, mounted_paths)
 
         store_status(job_id, {"status": "executing"})
         result = run_command([OPENCLAW_RUNNER, str(repo_dir), str(task_file), job_id], cwd=job_dir)
+
+        # Cleanup mounted references before collecting diffs
+        cleanup_references(mounted_paths)
 
         if result.returncode != 0:
             git_summary = collect_git_summary(repo_dir)
@@ -494,6 +624,196 @@ def _execute_pr_comment_job(
         },
     )
     print(f"Job {job_id}: Pushed fix to PR #{pr_number} at {pr_url}")
+
+
+# ---------------------------------------------------------------------------
+# Create project job
+# ---------------------------------------------------------------------------
+
+def _execute_create_project_job(
+    job_id: str, payload: dict, job_dir: Path, repo_dir: Path,
+) -> None:
+    """Create a new GitHub repo, optionally run an initial task."""
+    name = payload["name"]
+    description = payload.get("description", "")
+    private = payload.get("private", False)
+    org = payload.get("org", "")
+    initial_task = payload.get("task", "")
+
+    store_status(job_id, {"status": "creating_repo"})
+    clone_url = create_github_repo(name, description, private, org)
+
+    # Register in allowed repos
+    redis_client.sadd(ALLOWED_REPOS_KEY, clone_url)
+    print(f"Job {job_id}: Created repo {clone_url}")
+
+    if not initial_task:
+        store_status(
+            job_id,
+            {
+                "status": "completed",
+                "result_summary": f"Repository created: {clone_url}",
+                "repo_url": clone_url,
+            },
+        )
+        return
+
+    # Run initial task on the new repo
+    store_status(job_id, {"status": "running", "repo": clone_url})
+    clone_repo(clone_url, repo_dir)
+
+    task_payload = {
+        **payload,
+        "repo": clone_url,
+        "branch": "main",
+    }
+    task_file = write_task_file(job_dir, task_payload)
+
+    store_status(job_id, {"status": "executing"})
+    result = run_command([OPENCLAW_RUNNER, str(repo_dir), str(task_file), job_id], cwd=job_dir)
+
+    if result.returncode != 0:
+        store_status(
+            job_id,
+            {
+                "status": "failed",
+                "error": result.stderr.strip() or result.stdout.strip() or "Runner failed",
+                "repo_url": clone_url,
+            },
+        )
+        return
+
+    git_summary = collect_git_summary(repo_dir)
+    diff_stat, diff = collect_git_diff_detail(repo_dir)
+    file_change_summary = collect_file_change_summary(repo_dir)
+
+    if not diff_stat:
+        store_status(
+            job_id,
+            {
+                "status": "completed",
+                "result_summary": f"Repo created: {clone_url}\nNo file changes from initial task.",
+                "repo_url": clone_url,
+            },
+        )
+        return
+
+    commit_message = build_commit_message(task_payload, file_change_summary, diff_stat)
+    branch_name = f"openclaw/{job_id[:8]}"
+    base_branch = detect_default_branch(repo_dir)
+    owner, repo_name = parse_github_owner_repo(clone_url)
+
+    store_status(job_id, {"status": "pushing"})
+    git_commit_and_push(repo_dir, branch_name, commit_message)
+
+    store_status(job_id, {"status": "creating_pr"})
+    pr_title = f"openclaw: {initial_task[:60]}"
+    pr_body = build_pr_body(task_payload, file_change_summary, diff_stat, diff)
+    pr_url = create_pull_request(owner, repo_name, branch_name, base_branch, pr_title, pr_body)
+
+    store_status(
+        job_id,
+        {
+            "status": "completed",
+            "result_summary": f"Repo created: {clone_url}\n{git_summary}",
+            "repo_url": clone_url,
+            "pr_url": pr_url,
+        },
+    )
+    print(f"Job {job_id}: Created repo {clone_url}, PR at {pr_url}")
+
+
+# ---------------------------------------------------------------------------
+# Add reference job
+# ---------------------------------------------------------------------------
+
+def _execute_add_reference_job(
+    job_id: str, payload: dict, job_dir: Path, repo_dir: Path,
+) -> None:
+    """Add a cross-repo reference to openclaw.yml and create a PR."""
+    target_repo = payload["repo"]
+    ref_repo = payload["ref_repo"]
+    ref_path = payload.get("ref_path", ".")
+    mount_as = payload["mount_as"]
+
+    clone_repo(target_repo, repo_dir)
+
+    config_path = repo_dir / "openclaw.yml"
+    if config_path.exists():
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    else:
+        config = {}
+
+    references = config.get("references", [])
+
+    # Check for duplicate
+    for existing in references:
+        if existing.get("repo") == ref_repo and existing.get("mount_as") == mount_as:
+            store_status(
+                job_id,
+                {
+                    "status": "completed",
+                    "result_summary": "Reference already exists in openclaw.yml.",
+                },
+            )
+            return
+
+    references.append({
+        "repo": ref_repo,
+        "path": ref_path,
+        "mount_as": mount_as,
+    })
+    config["references"] = references
+
+    config_path.write_text(
+        yaml.dump(config, default_flow_style=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+    # Stage, commit, push, create PR
+    run_command(["git", "add", "openclaw.yml"], cwd=repo_dir)
+    diff_stat, diff = collect_git_diff_detail(repo_dir)
+    file_change_summary = collect_file_change_summary(repo_dir)
+
+    if not diff_stat:
+        store_status(job_id, {"status": "completed", "result_summary": "No changes to openclaw.yml."})
+        return
+
+    branch_name = f"openclaw/add-ref-{job_id[:8]}"
+    base_branch = detect_default_branch(repo_dir)
+    owner, repo_name = parse_github_owner_repo(target_repo)
+
+    commit_msg = f"openclaw: add reference to {ref_repo}"
+    _configure_git(repo_dir)
+    store_status(job_id, {"status": "pushing"})
+    git_commit_and_push(repo_dir, branch_name, commit_msg)
+
+    store_status(job_id, {"status": "creating_pr"})
+    pr_title = f"openclaw: add cross-repo reference"
+    pr_body = f"""## Add Cross-Repo Reference
+
+Added reference to `{ref_repo}` in `openclaw.yml`.
+
+| Field | Value |
+|-------|-------|
+| **Referenced repo** | `{ref_repo}` |
+| **Path** | `{ref_path}` |
+| **Mount as** | `{mount_as}` |
+
+---
+*Generated by OpenClaw Bot*
+"""
+    pr_url = create_pull_request(owner, repo_name, branch_name, base_branch, pr_title, pr_body)
+
+    store_status(
+        job_id,
+        {
+            "status": "completed",
+            "result_summary": f"Added reference to {ref_repo}",
+            "pr_url": pr_url,
+        },
+    )
+    print(f"Job {job_id}: Added reference PR at {pr_url}")
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ services:
     build:
       context: ./worker
     restart: unless-stopped
+    privileged: true
     env_file:
       - .env
     depends_on:

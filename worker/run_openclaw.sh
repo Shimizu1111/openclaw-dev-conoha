@@ -4,7 +4,7 @@ set -eu
 REPO_DIR="${1:?repo_dir is required}"
 TASK_FILE="${2:?task_file is required}"
 JOB_ID="${3:?job_id is required}"
-CODEX_SANDBOX="${CODEX_SANDBOX:-workspace-write}"
+CODEX_SANDBOX="${CODEX_SANDBOX:-full-auto}"
 CODEX_MODEL="${CODEX_MODEL:-}"
 CODEX_PROFILE="${CODEX_PROFILE:-}"
 
@@ -14,7 +14,7 @@ echo "Task file: ${TASK_FILE}"
 
 cd "${REPO_DIR}"
 
-ARGS=(-a never exec -s "${CODEX_SANDBOX}" -C "${REPO_DIR}" -)
+ARGS=(exec -s "${CODEX_SANDBOX}" -C "${REPO_DIR}" -)
 
 if [ -n "${CODEX_MODEL}" ]; then
   ARGS=(-m "${CODEX_MODEL}" "${ARGS[@]}")

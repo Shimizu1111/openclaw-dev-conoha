@@ -144,6 +144,8 @@ async def job_status(interaction: discord.Interaction, job_id: str) -> None:
         f"Updated at: `{status.get('updated_at', '-')}`",
     ]
 
+    if status.get("pr_url"):
+        lines.append(f"PR: {status['pr_url']}")
     if status.get("result_summary"):
         lines.append(f"Summary: {status['result_summary']}")
     if status.get("error"):

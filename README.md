@@ -157,3 +157,5 @@ docker compose up --build -d
 - Discord の特定ロールだけコマンド実行可能にする
 - 実行ログを永続化する
 - ドメインを付与して HTTPS を有効にする
+
+<!-- webhook smoke test -->

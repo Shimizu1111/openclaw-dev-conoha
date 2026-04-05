@@ -20,6 +20,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 COPY run_openclaw.sh .
-RUN chmod +x /app/run_openclaw.sh
+COPY entrypoint.sh .
+RUN chmod +x /app/run_openclaw.sh /app/entrypoint.sh
 
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["python", "app.py"]

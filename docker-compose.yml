@@ -28,8 +28,7 @@ services:
     volumes:
       - workspace_data:/workspace/jobs
       - ${CODEX_HOST_CONFIG_DIR:-/root/.codex}:/root/.codex
-      - ~/.ssh:/root/.ssh:ro
-      - ~/.ssh:/home/node/.ssh:ro
+      - ~/.ssh:/tmp/ssh-keys:ro
 
   webhook:
     build:

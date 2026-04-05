@@ -26,6 +26,9 @@ services:
     volumes:
       - workspace_data:/workspace/jobs
       - ${CODEX_HOST_CONFIG_DIR:-/root/.codex}:/root/.codex
+      - ~/.ssh/id_ed25519:/root/.ssh/id_ed25519:ro
+      - ~/.ssh/id_ed25519.pub:/root/.ssh/id_ed25519.pub:ro
+      - ~/.ssh/known_hosts:/root/.ssh/known_hosts:ro
 
   webhook:
     build:

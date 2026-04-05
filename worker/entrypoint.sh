@@ -13,9 +13,16 @@ for home_dir in /root /home/node; do
         cp /tmp/ssh-keys/id_ed25519 "${home_dir}/.ssh/id_ed25519"
         cp /tmp/ssh-keys/id_ed25519.pub "${home_dir}/.ssh/id_ed25519.pub" 2>/dev/null || true
         cp /tmp/ssh-keys/known_hosts "${home_dir}/.ssh/known_hosts" 2>/dev/null || true
-        cp /tmp/ssh-keys/config "${home_dir}/.ssh/config" 2>/dev/null || true
         chmod 700 "${home_dir}/.ssh"
         chmod 600 "${home_dir}/.ssh/id_ed25519"
+        # Write SSH config with correct path for each user
+        cat > "${home_dir}/.ssh/config" <<SSHEOF
+Host github.com
+    IdentityFile ${home_dir}/.ssh/id_ed25519
+    StrictHostKeyChecking accept-new
+    User git
+SSHEOF
+        chmod 600 "${home_dir}/.ssh/config"
     fi
 done
 

@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timezone
 
 import discord
+import requests as http_requests
 from discord import app_commands
 from redis import Redis
 
@@ -19,6 +20,7 @@ JOB_STATUS_PREFIX = os.getenv("JOB_STATUS_PREFIX", "openclaw:job:")
 DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 DISCORD_GUILD_ID = int(os.environ["DISCORD_GUILD_ID"])
 DEFAULT_BRANCH = os.getenv("DEFAULT_BRANCH", "main")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 SYNC_COMMANDS = os.getenv("SYNC_COMMANDS", "true").lower() == "true"
 
 ALLOWED_REPOS_KEY = "openclaw:allowed_repos"
@@ -455,33 +457,71 @@ async def _poll_and_reply(channel, message, job_id: str) -> None:
         await message.reply(f"Error polling result: {exc}")
 
 
-def _detect_repo_from_message(content: str) -> str | None:
-    """Try to find a matching allowed repo URL from keywords in the message.
+def _check_github_repo_exists(org: str, name: str) -> str | None:
+    """Check if a GitHub repo exists via API. Returns clone_url or None."""
+    url = f"https://api.github.com/repos/{org}/{name}"
+    headers = {"Accept": "application/vnd.github+json"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    try:
+        resp = http_requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            return resp.json().get("clone_url", "")
+    except Exception:
+        pass
+    return None
 
-    Checks against:
+
+def _extract_repo_like_words(content: str) -> list[str]:
+    """Extract words that look like they could be repo names (contain hyphens, dots, etc)."""
+    # Match words that look like repo names: alphanumeric with hyphens/dots/underscores
+    candidates = re.findall(r'[a-zA-Z0-9][a-zA-Z0-9._-]{2,}', content)
+    # Filter out common Japanese/English stop words and short words
+    stop = {"the", "and", "for", "from", "with", "this", "that", "github", "プロジェクト", "リポジトリ", "実装", "内容"}
+    return [c for c in candidates if c.lower() not in stop]
+
+
+def _detect_repo_from_message(content: str) -> str | None:
+    """Try to find a matching repo URL from keywords in the message.
+
+    Checks in order:
     1. Allowed repos in Redis (matches repo name portion of the URL)
-    2. Registered projects in Redis (matches project name)
+    2. Registered projects in Redis
+    3. GitHub API: tries {GITHUB_DEFAULT_ORG}/{word} for repo-like words
+       and auto-registers to allowed repos if found
     """
     lower = content.lower()
 
-    # Check allowed repos: extract repo name from URL and match
+    # 1. Check allowed repos: extract repo name from URL and match
     allowed = redis_client.smembers(ALLOWED_REPOS_KEY)
     for repo_url in allowed:
-        # Extract repo name from URL like https://github.com/owner/repo-name.git
         parts = repo_url.rstrip("/").rstrip(".git").split("/")
         if parts:
             repo_name = parts[-1].lower()
             if repo_name in lower:
                 return repo_url
 
-    # Check registered projects: project name -> look up if an allowed repo matches
+    # 2. Check registered projects
     projects = redis_client.hgetall(PROJECTS_KEY)
     for proj_name, proj_path in projects.items():
         if proj_name.lower() in lower:
-            # See if there's an allowed repo matching this project name
             for repo_url in allowed:
                 if proj_name.lower() in repo_url.lower():
                     return repo_url
+
+    # 3. Try GitHub API with GITHUB_DEFAULT_ORG
+    org = GITHUB_DEFAULT_ORG
+    if not org:
+        return None
+
+    candidates = _extract_repo_like_words(content)
+    for candidate in candidates:
+        clone_url = _check_github_repo_exists(org, candidate)
+        if clone_url:
+            # Auto-register to allowed repos
+            redis_client.sadd(ALLOWED_REPOS_KEY, clone_url)
+            print(f"Auto-registered repo: {clone_url}")
+            return clone_url
 
     return None
 

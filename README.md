@@ -14,6 +14,7 @@ MVP では次の Slash Command を想定しています。
 
 - `/dev-task`: 開発依頼を投入
 - `/job-status`: ジョブ状態を確認
+- `/create-project`: 新規 repo を作成し、必要なら GitHub 上の既存プロジェクト内容を取り込む
 
 ## Architecture
 
@@ -97,6 +98,21 @@ docker compose up --build -d
 ### `/job-status`
 
 - `job_id`: ジョブ ID
+
+### `/create-project`
+
+- `name`: 作成するリポジトリ名
+- `description`: GitHub repo description
+- `task`: 初回実装タスク。指定時は branch を切って PR まで作成
+- `private`: private repo として作るか
+- `org`: 作成先の GitHub org / user
+- `source_repo`: 既存 GitHub リポジトリ URL。指定時はその内容を新規 repo の初期状態として import
+
+例:
+
+```text
+/create-project name:web-all-consulting-prod source_repo:https://github.com/Shimizu1111/web-all-consulting.git task:README と運用設定を本番向けに整備して
+```
 
 ## OpenClaw Integration
 

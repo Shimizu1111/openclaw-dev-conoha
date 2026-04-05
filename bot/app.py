@@ -178,6 +178,9 @@ async def job_status(interaction: discord.Interaction, job_id: str) -> None:
 GITHUB_DEFAULT_ORG = os.getenv("GITHUB_DEFAULT_ORG", "")
 
 REPO_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+GITHUB_REPO_URL_RE = re.compile(
+    r"^(?:https://github\.com/[^/\s]+/[^/\s]+(?:\.git)?|git@github\.com:[^/\s]+/[^/\s]+(?:\.git)?)$"
+)
 
 
 @bot.tree.command(
@@ -191,6 +194,7 @@ REPO_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
     task="Optional initial development task for OpenClaw to execute",
     private="Whether the repo should be private (default: False)",
     org="GitHub org or user (defaults to GITHUB_DEFAULT_ORG)",
+    source_repo="Optional GitHub repository to import as the initial project contents",
 )
 async def create_project(
     interaction: discord.Interaction,
@@ -199,6 +203,7 @@ async def create_project(
     task: str = "",
     private: bool = False,
     org: str = "",
+    source_repo: str = "",
 ) -> None:
     await interaction.response.defer(ephemeral=True)
 
@@ -217,6 +222,14 @@ async def create_project(
         )
         return
 
+    normalized_source_repo = source_repo.strip()
+    if normalized_source_repo and not GITHUB_REPO_URL_RE.match(normalized_source_repo):
+        await interaction.followup.send(
+            "Invalid `source_repo`. Use a GitHub HTTPS or SSH repository URL.",
+            ephemeral=True,
+        )
+        return
+
     job_id = str(uuid.uuid4())
     payload = {
         "job_id": job_id,
@@ -226,6 +239,7 @@ async def create_project(
         "task": task,
         "private": private,
         "org": target_org,
+        "source_repo": normalized_source_repo,
         "requested_by": str(interaction.user),
         "requested_by_id": str(interaction.user.id),
         "created_at": utc_now(),
@@ -237,6 +251,7 @@ async def create_project(
             "status": "queued",
             "repo": f"(new) {target_org}/{name}",
             "task": task or "(create repo only)",
+            "source_repo": normalized_source_repo,
             "requested_by": str(interaction.user),
             "created_at": payload["created_at"],
             "updated_at": payload["created_at"],
@@ -249,10 +264,12 @@ async def create_project(
         f"Repo: `{target_org}/{name}`",
         f"Private: `{private}`",
     ]
+    if normalized_source_repo:
+        lines.append(f"Source repo: `{normalized_source_repo}`")
     if task:
         lines.append(f"Initial task: {task}")
     else:
-        lines.append("No initial task — repo will be created empty.")
+        lines.append("No initial task — repo will only be created/imported.")
 
     await interaction.followup.send("\n".join(lines), ephemeral=True)
 

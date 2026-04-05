@@ -455,6 +455,37 @@ async def _poll_and_reply(channel, message, job_id: str) -> None:
         await message.reply(f"Error polling result: {exc}")
 
 
+def _detect_repo_from_message(content: str) -> str | None:
+    """Try to find a matching allowed repo URL from keywords in the message.
+
+    Checks against:
+    1. Allowed repos in Redis (matches repo name portion of the URL)
+    2. Registered projects in Redis (matches project name)
+    """
+    lower = content.lower()
+
+    # Check allowed repos: extract repo name from URL and match
+    allowed = redis_client.smembers(ALLOWED_REPOS_KEY)
+    for repo_url in allowed:
+        # Extract repo name from URL like https://github.com/owner/repo-name.git
+        parts = repo_url.rstrip("/").rstrip(".git").split("/")
+        if parts:
+            repo_name = parts[-1].lower()
+            if repo_name in lower:
+                return repo_url
+
+    # Check registered projects: project name -> look up if an allowed repo matches
+    projects = redis_client.hgetall(PROJECTS_KEY)
+    for proj_name, proj_path in projects.items():
+        if proj_name.lower() in lower:
+            # See if there's an allowed repo matching this project name
+            for repo_url in allowed:
+                if proj_name.lower() in repo_url.lower():
+                    return repo_url
+
+    return None
+
+
 def _try_local_answer(content: str) -> str | None:
     """Check if the question can be answered from Redis data (projects, repos)."""
     lower = content.lower()
@@ -516,6 +547,12 @@ async def on_message(message: discord.Message) -> None:
         if not content:
             await message.reply("Please provide a message after the repo URL.")
             return
+
+    # Auto-detect repo name from message if not explicitly specified
+    if not repo:
+        detected = _detect_repo_from_message(content)
+        if detected:
+            repo = detected
 
     # Show typing indicator
     async with message.channel.typing():

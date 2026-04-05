@@ -20,8 +20,9 @@ services:
     init: true
     restart: unless-stopped
     networks:
-      - default
-      - traefik_net
+      default:
+        ipv4_address: 172.19.0.100
+      traefik_net:
     command:
       [
         "node",
@@ -44,16 +45,6 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.openclaw.rule=Host(`openclaw.sk-techlab.com`)"
-      - "traefik.http.routers.openclaw.entrypoints=web"
-      - "traefik.http.routers.openclaw.priority=100"
-      - "traefik.http.routers.openclaw-secure.rule=Host(`openclaw.sk-techlab.com`)"
-      - "traefik.http.routers.openclaw-secure.entrypoints=websecure"
-      - "traefik.http.routers.openclaw-secure.tls.certresolver=letsencrypt"
-      - "traefik.http.services.openclaw.loadbalancer.server.port=18789"
-      - "traefik.docker.network=automation-stack_default"
 
   openclaw-cli:
     image: ${OPENCLAW_IMAGE:-openclaw:local}
@@ -83,6 +74,9 @@ services:
       - openclaw-gateway
 
 networks:
+  default:
+    external: true
+    name: openclaw_default
   traefik_net:
     external: true
     name: automation-stack_default

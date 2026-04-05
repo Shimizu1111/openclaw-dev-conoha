@@ -1,0 +1,21 @@
+http:
+  routers:
+    openclaw:
+      rule: "Host(`openclaw.sk-techlab.com`)"
+      entryPoints:
+        - web
+      service: openclaw
+      priority: 100
+    openclaw-secure:
+      rule: "Host(`openclaw.sk-techlab.com`)"
+      entryPoints:
+        - websecure
+      service: openclaw
+      tls:
+        certResolver: letsencrypt
+      priority: 100
+  services:
+    openclaw:
+      loadBalancer:
+        servers:
+          - url: "http://172.19.0.100:18789"

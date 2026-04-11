@@ -22,6 +22,7 @@ DISCORD_GUILD_ID = int(os.environ["DISCORD_GUILD_ID"])
 DEFAULT_BRANCH = os.getenv("DEFAULT_BRANCH", "main")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 SYNC_COMMANDS = os.getenv("SYNC_COMMANDS", "true").lower() == "true"
+OPENCLAW_GATEWAY_URL = os.getenv("OPENCLAW_GATEWAY_URL", "https://openclaw.sk-techlab.com")
 
 ALLOWED_REPOS_KEY = "openclaw:allowed_repos"
 
@@ -322,6 +323,105 @@ async def add_reference(
     )
 
 
+CLAUDE_MOBILE_URL_KEY = "claude:mobile:url"
+CLAUDE_MOBILE_REQUEST_KEY = "claude:mobile:request"
+CLAUDE_MOBILE_STATUS_KEY = "claude:mobile:status"
+
+
+@bot.tree.command(
+    name="claude-mobile",
+    description="Claude Codeをスマホから操作するためのURLを取得。フォルダ指定で新しいセッション起動。",
+    guild=discord.Object(id=DISCORD_GUILD_ID),
+)
+@app_commands.describe(
+    folder="作業フォルダのパス (例: /root/apps/openclaw-dev-conoha)",
+    project="登録済みプロジェクト名 (register-projectで登録したもの)",
+)
+async def claude_mobile(
+    interaction: discord.Interaction,
+    folder: str = "",
+    project: str = "",
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+
+    # プロジェクト名からフォルダを解決
+    if project and not folder:
+        projects = _get_all_projects()
+        path = projects.get(project)
+        if path:
+            folder = path
+        else:
+            await interaction.followup.send(
+                f"プロジェクト `{project}` が見つかりません。`/list-projects` で確認してください。",
+                ephemeral=True,
+            )
+            return
+
+    if folder:
+        # 前回のステータスをリセット
+        redis_client.delete(CLAUDE_MOBILE_STATUS_KEY)
+        # 新しいセッションをリクエスト
+        request = json.dumps({"dir": folder, "requested_by": str(interaction.user)})
+        redis_client.rpush(CLAUDE_MOBILE_REQUEST_KEY, request)
+        await interaction.followup.send(
+            f"Claude Code Remote Controlを `{folder}` で起動中...\n30秒ほどお待ちください。",
+            ephemeral=True,
+        )
+
+        # URLが来るまでポーリング (最大30秒)
+        for _ in range(15):
+            await asyncio.sleep(2)
+            status = redis_client.get(CLAUDE_MOBILE_STATUS_KEY) or ""
+            if status.startswith("error:"):
+                await interaction.followup.send(f"エラー: {status}", ephemeral=True)
+                return
+            url = redis_client.get(CLAUDE_MOBILE_URL_KEY)
+            if url and status == "running":
+                await interaction.followup.send(
+                    f"**Claude Code Remote Control**\n\n"
+                    f"スマホでこのURLを開いてください:\n{url}\n\n"
+                    f"接続したら最初に以下を伝えてください:\n"
+                    f"```\n{folder} で作業して\n```",
+                    ephemeral=True,
+                )
+                return
+
+        await interaction.followup.send(
+            "タイムアウト: URLの取得に時間がかかっています。`/claude-mobile` を引数なしで再実行してください。",
+            ephemeral=True,
+        )
+    else:
+        # 引数なし: 現在のURLを返す
+        url = redis_client.get(CLAUDE_MOBILE_URL_KEY)
+        if url:
+            await interaction.followup.send(
+                f"**Claude Code Remote Control**\n\n"
+                f"スマホでこのURLを開いてください:\n{url}\n\n"
+                f"Claudeアプリまたはブラウザ(claude.ai/code)から接続できます。",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                "Remote Control URLが見つかりません。`/claude-mobile folder:/path/to/project` でセッションを起動してください。",
+                ephemeral=True,
+            )
+
+
+@bot.tree.command(
+    name="openclaw-chat",
+    description="OpenClaw Gateway チャットUIのURLを表示する。",
+    guild=discord.Object(id=DISCORD_GUILD_ID),
+)
+async def openclaw_chat(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+    chat_url = f"{OPENCLAW_GATEWAY_URL}/chat"
+    await interaction.followup.send(
+        f"**OpenClaw Gateway Chat**\n\n"
+        f"以下のURLからチャットUIにアクセスできます:\n{chat_url}",
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(
     name="list-repos",
     description="List all allowed repositories.",
@@ -340,6 +440,41 @@ async def list_repos(interaction: discord.Interaction) -> None:
 
 
 PROJECTS_KEY = "openclaw:projects"
+PROJECTS_FILE = os.getenv("PROJECTS_FILE", "/workspace/jobs/.projects.json")
+
+
+def _load_projects_file() -> dict:
+    """Load projects from shared JSON file."""
+    try:
+        with open(PROJECTS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_projects_file(data: dict) -> None:
+    """Save projects to shared JSON file."""
+    os.makedirs(os.path.dirname(PROJECTS_FILE), exist_ok=True)
+    with open(PROJECTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def _sync_project_to_redis(name: str, path: str) -> None:
+    """Sync a single project to Redis."""
+    redis_client.hset(PROJECTS_KEY, name, path)
+
+
+def _delete_project_from_redis(name: str) -> None:
+    """Delete a project from Redis."""
+    redis_client.hdel(PROJECTS_KEY, name)
+
+
+def _get_all_projects() -> dict:
+    """Get projects from both Redis and file, merged."""
+    redis_projects = redis_client.hgetall(PROJECTS_KEY)
+    file_projects = _load_projects_file()
+    merged = {**file_projects, **redis_projects}
+    return merged
 
 
 @bot.tree.command(
@@ -349,7 +484,7 @@ PROJECTS_KEY = "openclaw:projects"
 )
 async def list_projects(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
-    projects = redis_client.hgetall(PROJECTS_KEY)
+    projects = _get_all_projects()
     if projects:
         lines = [f"**Projects ({len(projects)}):**"]
         for name, path in sorted(projects.items()):
@@ -370,8 +505,33 @@ async def list_projects(interaction: discord.Interaction) -> None:
 )
 async def register_project(interaction: discord.Interaction, name: str, path: str) -> None:
     await interaction.response.defer(ephemeral=True)
-    redis_client.hset(PROJECTS_KEY, name, path)
+    _sync_project_to_redis(name, path)
+    data = _load_projects_file()
+    data[name] = path
+    _save_projects_file(data)
     await interaction.followup.send(f"Registered project **{name}** at `{path}`", ephemeral=True)
+
+
+@bot.tree.command(
+    name="update-project",
+    description="Update a project's directory path.",
+    guild=discord.Object(id=DISCORD_GUILD_ID),
+)
+@app_commands.describe(
+    name="Project name to update",
+    path="New directory path",
+)
+async def update_project(interaction: discord.Interaction, name: str, path: str) -> None:
+    await interaction.response.defer(ephemeral=True)
+    projects = _get_all_projects()
+    if name not in projects:
+        await interaction.followup.send(f"Project **{name}** not found.", ephemeral=True)
+        return
+    _sync_project_to_redis(name, path)
+    data = _load_projects_file()
+    data[name] = path
+    _save_projects_file(data)
+    await interaction.followup.send(f"Updated project **{name}** to `{path}`", ephemeral=True)
 
 
 @bot.tree.command(
@@ -382,11 +542,15 @@ async def register_project(interaction: discord.Interaction, name: str, path: st
 @app_commands.describe(name="Project name to remove")
 async def unregister_project(interaction: discord.Interaction, name: str) -> None:
     await interaction.response.defer(ephemeral=True)
-    removed = redis_client.hdel(PROJECTS_KEY, name)
-    if removed:
-        await interaction.followup.send(f"Removed project **{name}**.", ephemeral=True)
-    else:
+    projects = _get_all_projects()
+    if name not in projects:
         await interaction.followup.send(f"Project **{name}** not found.", ephemeral=True)
+        return
+    _delete_project_from_redis(name)
+    data = _load_projects_file()
+    data.pop(name, None)
+    _save_projects_file(data)
+    await interaction.followup.send(f"Removed project **{name}**.", ephemeral=True)
 
 
 @bot.event

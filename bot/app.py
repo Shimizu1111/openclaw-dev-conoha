@@ -408,16 +408,29 @@ async def claude_mobile(
 
 
 @bot.tree.command(
-    name="openclaw-chat",
-    description="OpenClaw Gateway チャットUIのURLを表示する。",
+    name="openclaw-chat-codex",
+    description="Codex チャットUIのURLを表示する。",
     guild=discord.Object(id=DISCORD_GUILD_ID),
 )
-async def openclaw_chat(interaction: discord.Interaction) -> None:
+async def openclaw_chat_codex(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
-    chat_url = f"{OPENCLAW_GATEWAY_URL}/chat"
+    chat_url = f"{OPENCLAW_GATEWAY_URL}/chat?sessionKey=agent%3Agemini%3Adefault&session=agent%3Amain%3Amain"
     await interaction.followup.send(
-        f"**OpenClaw Gateway Chat**\n\n"
-        f"以下のURLからチャットUIにアクセスできます:\n{chat_url}",
+        f"**OpenClaw Chat (Codex)**\n\n{chat_url}",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="openclaw-chat-gemini",
+    description="Gemini チャットUIのURLを表示する。",
+    guild=discord.Object(id=DISCORD_GUILD_ID),
+)
+async def openclaw_chat_gemini(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+    chat_url = f"{OPENCLAW_GATEWAY_URL}/chat?sessionKey=agent%3Agemini%3Adefault&session=agent%3Agemini%3Amain"
+    await interaction.followup.send(
+        f"**OpenClaw Chat (Gemini)**\n\n{chat_url}",
         ephemeral=True,
     )
 

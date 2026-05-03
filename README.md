@@ -1,3 +1,4 @@
+smoke test OK
 hello world2
 
 ConoHa VPS 上に OpenClaw 実行基盤を置き、Discord から開発依頼を送れるようにするための MVP 構成です。
@@ -157,3 +158,5 @@ docker compose up --build -d
 - Discord の特定ロールだけコマンド実行可能にする
 - 実行ログを永続化する
 - ドメインを付与して HTTPS を有効にする
+
+<!-- webhook smoke test -->

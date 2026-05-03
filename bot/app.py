@@ -326,6 +326,8 @@ async def add_reference(
 CLAUDE_MOBILE_URL_KEY = "claude:mobile:url"
 CLAUDE_MOBILE_REQUEST_KEY = "claude:mobile:request"
 CLAUDE_MOBILE_STATUS_KEY = "claude:mobile:status"
+CLAUDE_MOBILE_DEFAULT_DIR = os.getenv("CLAUDE_MOBILE_DEFAULT_DIR", "/root/projects")
+AI_SECRETARY_DIR = os.getenv("AI_SECRETARY_DIR", "/root/projects/ai-secretary")
 
 
 @bot.tree.command(
@@ -357,8 +359,11 @@ async def claude_mobile(
             )
             return
 
+    # 引数なしの場合はデフォルトディレクトリで起動
+    if not folder:
+        folder = CLAUDE_MOBILE_DEFAULT_DIR
+
     if folder:
-        # 前回のステータスをリセット
         redis_client.delete(CLAUDE_MOBILE_STATUS_KEY)
         # 新しいセッションをリクエスト
         request = json.dumps({"dir": folder, "requested_by": str(interaction.user)})
@@ -387,24 +392,116 @@ async def claude_mobile(
                 return
 
         await interaction.followup.send(
-            "タイムアウト: URLの取得に時間がかかっています。`/claude-mobile` を引数なしで再実行してください。",
+            "タイムアウト: URLの取得に時間がかかっています。もう一度 `/claude-mobile` を実行してください。",
             ephemeral=True,
         )
-    else:
-        # 引数なし: 現在のURLを返す
-        url = redis_client.get(CLAUDE_MOBILE_URL_KEY)
-        if url:
-            await interaction.followup.send(
-                f"**Claude Code Remote Control**\n\n"
-                f"スマホでこのURLを開いてください:\n{url}\n\n"
-                f"Claudeアプリまたはブラウザ(claude.ai/code)から接続できます。",
-                ephemeral=True,
-            )
+
+
+@bot.tree.command(
+    name="claude-mobile-auto",
+    description="確認なしモードでClaude Codeをスマホから操作するためのURLを取得。",
+    guild=discord.Object(id=DISCORD_GUILD_ID),
+)
+@app_commands.describe(
+    folder="作業フォルダのパス (例: /root/apps/openclaw-dev-conoha)",
+    project="登録済みプロジェクト名 (register-projectで登録したもの)",
+)
+async def claude_mobile_auto(
+    interaction: discord.Interaction,
+    folder: str = "",
+    project: str = "",
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+
+    if project and not folder:
+        projects = _get_all_projects()
+        path = projects.get(project)
+        if path:
+            folder = path
         else:
             await interaction.followup.send(
-                "Remote Control URLが見つかりません。`/claude-mobile folder:/path/to/project` でセッションを起動してください。",
+                f"プロジェクト `{project}` が見つかりません。`/list-projects` で確認してください。",
                 ephemeral=True,
             )
+            return
+
+    if not folder:
+        folder = CLAUDE_MOBILE_DEFAULT_DIR
+
+    if folder:
+        redis_client.delete(CLAUDE_MOBILE_STATUS_KEY)
+        request = json.dumps({"dir": folder, "requested_by": str(interaction.user), "skip_permissions": True})
+        redis_client.rpush(CLAUDE_MOBILE_REQUEST_KEY, request)
+        await interaction.followup.send(
+            f"Claude Code Remote Control (確認なしモード) を `{folder}` で起動中...\n30秒ほどお待ちください。",
+            ephemeral=True,
+        )
+
+        for _ in range(15):
+            await asyncio.sleep(2)
+            status = redis_client.get(CLAUDE_MOBILE_STATUS_KEY) or ""
+            if status.startswith("error:"):
+                await interaction.followup.send(f"エラー: {status}", ephemeral=True)
+                return
+            url = redis_client.get(CLAUDE_MOBILE_URL_KEY)
+            if url and status == "running":
+                await interaction.followup.send(
+                    f"**Claude Code Remote Control (確認なしモード)**\n\n"
+                    f"スマホでこのURLを開いてください:\n{url}\n\n"
+                    f"接続したら最初に以下を伝えてください:\n"
+                    f"```\n{folder} で作業して\n```",
+                    ephemeral=True,
+                )
+                return
+
+        await interaction.followup.send(
+            "タイムアウト: URLの取得に時間がかかっています。もう一度 `/claude-mobile-auto` を実行してください。",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="ai-secretary",
+    description="AI秘書を起動。スマホからURLで操作できます。",
+    guild=discord.Object(id=DISCORD_GUILD_ID),
+)
+async def ai_secretary(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+
+    folder = AI_SECRETARY_DIR
+
+    redis_client.delete(CLAUDE_MOBILE_STATUS_KEY)
+    request = json.dumps({"dir": folder, "requested_by": str(interaction.user)})
+    redis_client.rpush(CLAUDE_MOBILE_REQUEST_KEY, request)
+    await interaction.followup.send(
+        "AI秘書を起動中...\n30秒ほどお待ちください。",
+        ephemeral=True,
+    )
+
+    for _ in range(15):
+        await asyncio.sleep(2)
+        status = redis_client.get(CLAUDE_MOBILE_STATUS_KEY) or ""
+        if status.startswith("error:"):
+            await interaction.followup.send(f"エラー: {status}", ephemeral=True)
+            return
+        url = redis_client.get(CLAUDE_MOBILE_URL_KEY)
+        if url and status == "running":
+            await interaction.followup.send(
+                f"**AI Secretary - Kacchan**\n\n"
+                f"スマホでこのURLを開いてください:\n{url}\n\n"
+                f"何でも指示できます:\n"
+                f"- 「請求書を作って」\n"
+                f"- 「明日の予定を確認して」\n"
+                f"- 「メールを送って」\n"
+                f"- 「売上を見せて」",
+                ephemeral=True,
+            )
+            return
+
+    await interaction.followup.send(
+        "タイムアウト: もう一度 `/ai-secretary` を実行してください。",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(

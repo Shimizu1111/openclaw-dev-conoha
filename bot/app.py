@@ -385,8 +385,7 @@ async def claude_mobile(
                 await interaction.followup.send(
                     f"**Claude Code Remote Control**\n\n"
                     f"スマホでこのURLを開いてください:\n{url}\n\n"
-                    f"接続したら最初に以下を伝えてください:\n"
-                    f"```\n{folder} で作業して\n```",
+                    f"作業ディレクトリ: `{folder}`",
                     ephemeral=True,
                 )
                 return
@@ -448,8 +447,7 @@ async def claude_mobile_auto(
                 await interaction.followup.send(
                     f"**Claude Code Remote Control (確認なしモード)**\n\n"
                     f"スマホでこのURLを開いてください:\n{url}\n\n"
-                    f"接続したら最初に以下を伝えてください:\n"
-                    f"```\n{folder} で作業して\n```",
+                    f"作業ディレクトリ: `{folder}`",
                     ephemeral=True,
                 )
                 return

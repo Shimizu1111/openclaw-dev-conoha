@@ -87,6 +87,54 @@ def clone_and_checkout_branch(repo: str, destination: Path, branch: str) -> None
         raise RuntimeError(f"Failed to checkout branch {branch}: {result.stderr.strip()}")
 
 
+def sync_worktree(source_dir: Path, destination_dir: Path) -> None:
+    """Copy a repo working tree without git metadata into another repo checkout."""
+    for child in source_dir.iterdir():
+        if child.name == ".git":
+            continue
+        target = destination_dir / child.name
+        if target.exists():
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        if child.is_dir():
+            shutil.copytree(child, target)
+        else:
+            shutil.copy2(child, target)
+
+
+def bootstrap_repo_from_source(
+    source_repo: str, target_repo: str, target_dir: Path, base_branch: str,
+) -> None:
+    """Import source repo contents into a newly created target repo and push the first commit."""
+    source_clone_dir = target_dir.parent / "source-repo"
+    clone_repo(source_repo, source_clone_dir)
+    clone_repo(target_repo, target_dir)
+
+    sync_worktree(source_clone_dir, target_dir)
+    _configure_git(target_dir)
+
+    result = run_command(["git", "checkout", "-B", base_branch], cwd=target_dir)
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to create base branch {base_branch}: {result.stderr.strip()}")
+
+    result = run_command(["git", "add", "-A"], cwd=target_dir)
+    if result.returncode != 0:
+        raise RuntimeError(f"git add failed during bootstrap: {result.stderr.strip()}")
+
+    result = run_command(
+        ["git", "commit", "-m", f"Initial import from {source_repo}"],
+        cwd=target_dir,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git commit failed during bootstrap: {result.stderr.strip()}")
+
+    result = run_command(["git", "push", "-u", "origin", base_branch], cwd=target_dir)
+    if result.returncode != 0:
+        raise RuntimeError(f"git push failed during bootstrap: {result.stderr.strip()}")
+
+
 def detect_default_branch(repo_dir: Path) -> str:
     """Detect the default branch name from the cloned repo."""
     result = run_command(["git", "symbolic-ref", "refs/remotes/origin/HEAD"], cwd=repo_dir)
@@ -332,8 +380,10 @@ Stats:
 # GitHub repo creation
 # ---------------------------------------------------------------------------
 
-def create_github_repo(name: str, description: str, private: bool, org: str = "") -> str:
-    """Create a GitHub repo. Returns the clone URL (https)."""
+def create_github_repo(
+    name: str, description: str, private: bool, org: str = "", auto_init: bool = True,
+) -> dict:
+    """Create a GitHub repo and return essential metadata."""
     target_org = org or GITHUB_DEFAULT_ORG
     if target_org:
         url = f"https://api.github.com/orgs/{target_org}/repos"
@@ -344,7 +394,7 @@ def create_github_repo(name: str, description: str, private: bool, org: str = ""
         "name": name,
         "description": description,
         "private": private,
-        "auto_init": True,
+        "auto_init": auto_init,
     }
     resp = requests.post(url, headers=_github_headers(), json=data, timeout=30)
 
@@ -356,7 +406,12 @@ def create_github_repo(name: str, description: str, private: bool, org: str = ""
     if resp.status_code not in (200, 201):
         raise RuntimeError(f"Repo creation failed ({resp.status_code}): {resp.text}")
 
-    return resp.json()["clone_url"]
+    body = resp.json()
+    return {
+        "clone_url": body["clone_url"],
+        "html_url": body["html_url"],
+        "default_branch": body.get("default_branch") or "main",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -698,20 +753,39 @@ def _execute_create_project_job(
     private = payload.get("private", False)
     org = payload.get("org", "")
     initial_task = payload.get("task", "")
+    source_repo = payload.get("source_repo", "").strip()
+    auto_init = not source_repo
 
     store_status(job_id, {"status": "creating_repo"})
-    clone_url = create_github_repo(name, description, private, org)
+    repo_meta = create_github_repo(name, description, private, org, auto_init=auto_init)
+    clone_url = repo_meta["clone_url"]
+    base_branch = repo_meta["default_branch"]
 
     # Register in allowed repos
     redis_client.sadd(ALLOWED_REPOS_KEY, clone_url)
     print(f"Job {job_id}: Created repo {clone_url}")
+
+    if source_repo:
+        store_status(
+            job_id,
+            {
+                "status": "importing_source",
+                "repo": clone_url,
+                "source_repo": source_repo,
+            },
+        )
+        bootstrap_repo_from_source(source_repo, clone_url, repo_dir, base_branch)
 
     if not initial_task:
         store_status(
             job_id,
             {
                 "status": "completed",
-                "result_summary": f"Repository created: {clone_url}",
+                "result_summary": (
+                    f"Repository created: {clone_url}"
+                    if not source_repo
+                    else f"Repository created and imported from {source_repo}: {clone_url}"
+                ),
                 "repo_url": clone_url,
             },
         )
@@ -719,12 +793,13 @@ def _execute_create_project_job(
 
     # Run initial task on the new repo
     store_status(job_id, {"status": "running", "repo": clone_url})
-    clone_repo(clone_url, repo_dir)
+    if not source_repo:
+        clone_repo(clone_url, repo_dir)
 
     task_payload = {
         **payload,
         "repo": clone_url,
-        "branch": "main",
+        "branch": base_branch,
     }
     task_file = write_task_file(job_dir, task_payload)
 
@@ -759,7 +834,6 @@ def _execute_create_project_job(
 
     commit_message = build_commit_message(task_payload, file_change_summary, diff_stat)
     branch_name = f"openclaw/{job_id[:8]}"
-    base_branch = detect_default_branch(repo_dir)
     owner, repo_name = parse_github_owner_repo(clone_url)
 
     store_status(job_id, {"status": "pushing"})
